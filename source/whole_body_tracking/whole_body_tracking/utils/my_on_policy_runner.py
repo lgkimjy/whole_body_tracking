@@ -1,22 +1,38 @@
 import os
 
+import torch
+
 from rsl_rl.env import VecEnv
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
-from isaaclab_rl.rsl_rl import export_policy_as_onnx
+from types import MethodType
 
 import wandb
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+
+
+def _broadcast_module_parameters(module):
+    torch.cuda.synchronize()
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        torch.distributed.broadcast(tensor.data.contiguous(), src=0)
+    torch.cuda.synchronize()
+
+
+def _broadcast_parameters_tensorwise(alg):
+    _broadcast_module_parameters(alg.actor)
+    _broadcast_module_parameters(alg.critic)
+    if getattr(alg, "rnd", None):
+        _broadcast_module_parameters(alg.rnd.predictor)
 
 
 class MyOnPolicyRunner(OnPolicyRunner):
     def save(self, path: str, infos=None):
         """Save the model and training information."""
         super().save(path, infos)
-        if self.logger_type in ["wandb"]:
+        if getattr(self.logger, "logger_type", None) in ["wandb"]:
             policy_path = path.split("model")[0]
             filename = policy_path.split("/")[-2] + ".onnx"
-            export_policy_as_onnx(self.alg.policy, normalizer=self.obs_normalizer, path=policy_path, filename=filename)
+            self.export_policy_to_onnx(policy_path, filename=filename)
             attach_onnx_metadata(self.env.unwrapped, wandb.run.name, path=policy_path, filename=filename)
             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
 
@@ -26,16 +42,22 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu", registry_name: str = None
     ):
         super().__init__(env, train_cfg, log_dir, device)
+        if self.is_distributed:
+            self.alg.broadcast_parameters = MethodType(_broadcast_parameters_tensorwise, self.alg)
         self.registry_name = registry_name
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
         super().save(path, infos)
-        if self.logger_type in ["wandb"]:
+        if getattr(self.logger, "logger_type", None) in ["wandb"]:
             policy_path = path.split("model")[0]
             filename = policy_path.split("/")[-2] + ".onnx"
             export_motion_policy_as_onnx(
-                self.env.unwrapped, self.alg.policy, normalizer=self.obs_normalizer, path=policy_path, filename=filename
+                self.env.unwrapped,
+                self.alg.get_policy(),
+                normalizer=getattr(self, "obs_normalizer", None),
+                path=policy_path,
+                filename=filename,
             )
             attach_onnx_metadata(self.env.unwrapped, wandb.run.name, path=policy_path, filename=filename)
             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))

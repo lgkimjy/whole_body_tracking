@@ -30,7 +30,17 @@ def export_motion_policy_as_onnx(
 
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
-        super().__init__(actor_critic, normalizer, verbose)
+        if hasattr(actor_critic, "as_onnx"):
+            torch.nn.Module.__init__(self)
+            self.verbose = verbose
+            self.is_recurrent = actor_critic.is_recurrent
+            if self.is_recurrent:
+                raise NotImplementedError("Motion ONNX export for recurrent rsl_rl 5 models is not supported yet.")
+            self.actor = actor_critic.as_onnx(verbose)
+            self.normalizer = torch.nn.Identity()
+            self.input_size = self.actor.get_dummy_inputs()[0].shape[-1]
+        else:
+            super().__init__(actor_critic, normalizer, verbose)
         cmd: MotionCommand = env.command_manager.get_term("motion")
 
         self.joint_pos = cmd.motion.joint_pos.to("cpu")
@@ -55,14 +65,15 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def export(self, path, filename):
         self.to("cpu")
-        obs = torch.zeros(1, self.actor[0].in_features)
+        input_size = self.input_size if hasattr(self, "input_size") else self.actor[0].in_features
+        obs = torch.zeros(1, input_size)
         time_step = torch.zeros(1, 1)
         torch.onnx.export(
             self,
             (obs, time_step),
             os.path.join(path, filename),
             export_params=True,
-            opset_version=11,
+            opset_version=18,
             verbose=self.verbose,
             input_names=["obs", "time_step"],
             output_names=[
